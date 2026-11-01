@@ -1,0 +1,163 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 626f34d..27d7b2a 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -24,6 +24,10 @@ the items under New and Fixed.
+ 
+ ## [Unreleased]
+ 
++### Fixed
++
++- Wi-Fi, battery, clock, and input method use distinct symbols when menu bar captures are unavailable or app icons are preferred. These symbols identify the function; they do not show live status.
++
+ ## [2.2.0-beta.1] - 2026-10-28
+ 
+ **macOS 15 and 26 · Build 64**
+diff --git a/Thaw/MenuBar/IceBar/MenuBarItemIconFallback.swift b/Thaw/MenuBar/IceBar/MenuBarItemIconFallback.swift
+index fc417bc..15f981d 100644
+--- a/Thaw/MenuBar/IceBar/MenuBarItemIconFallback.swift
++++ b/Thaw/MenuBar/IceBar/MenuBarItemIconFallback.swift
+@@ -16,6 +16,10 @@ import Cocoa
+ ///
+ /// The per-process cache is load-bearing; see ``appIconsByPID``.
+ enum MenuBarItemIconFallback {
++    /// A small, bounded cache of symbols identifying system functions.
++    @MainActor
++    private static var systemSymbols = [String: NSImage]()
++
+     /// The Control Center icon once it has been resolved.
+     @MainActor
+     private static var cachedControlCenterIcon: NSImage?
+@@ -113,6 +117,19 @@ enum MenuBarItemIconFallback {
+     /// icon.
+     @MainActor
+     static func appIcon(for item: MenuBarItem) -> NSImage? {
++        if let name = systemSymbolName(for: item) {
++            if let image = systemSymbols[name] {
++                return image
++            }
++            let configuration = NSImage.SymbolConfiguration(paletteColors: [.labelColor])
++            if let image = NSImage(systemSymbolName: name, accessibilityDescription: item.displayName)?
++                .withSymbolConfiguration(configuration)
++            {
++                image.isTemplate = true
++                systemSymbols[name] = image
++                return image
++            }
++        }
+         switch item.tag.namespace {
+         case .controlCenter, .systemUIServer, .textInputMenuAgent:
+             // One process hosts many unrelated modules.
+@@ -124,4 +141,22 @@ enum MenuBarItemIconFallback {
+             return cachedAppIcon(forPID: sourcePID)
+         }
+     }
++
++    /// These identify a function rather than reporting its current state.
++    @MainActor
++    private static func systemSymbolName(for item: MenuBarItem) -> String? {
++        switch item.tag.namespace {
++        case .textInputMenuAgent:
++            return "keyboard"
++        case .controlCenter, .systemUIServer:
++            switch item.tag.title {
++            case "WiFi": return "wifi"
++            case "Battery": return "battery.0"
++            case "Clock": return "clock"
++            default: return nil
++            }
++        default:
++            return nil
++        }
++    }
+ }
+diff --git a/ThawTests/MenuBar/IceBar/MenuBarItemIconFallbackTests.swift b/ThawTests/MenuBar/IceBar/MenuBarItemIconFallbackTests.swift
+index 693796b..1b8917e 100644
+--- a/ThawTests/MenuBar/IceBar/MenuBarItemIconFallbackTests.swift
++++ b/ThawTests/MenuBar/IceBar/MenuBarItemIconFallbackTests.swift
+@@ -93,7 +93,6 @@ struct MenuBarItemIconFallbackTests {
+         for namespace in [
+             MenuBarItemTag.Namespace.controlCenter,
+             .systemUIServer,
+-            .textInputMenuAgent,
+         ] {
+             // Routing is by namespace, so a resolvable source PID loses to the host.
+             let item = item(namespace: namespace, title: "Module", sourcePID: ownPID)
+@@ -126,4 +125,77 @@ struct MenuBarItemIconFallbackTests {
+         #expect(MenuBarItemIconFallback.appIcon(for: item) != nil)
+         #expect(MenuBarItemIconFallback.image(for: item) != nil)
+     }
++
++    @Test("Known system functions have distinct, reusable template symbols")
++    func knownSystemFunctionsHaveDistinctSymbols() throws {
++        let items = [
++            item(namespace: .controlCenter, title: "WiFi", sourcePID: nil),
++            item(namespace: .controlCenter, title: "Battery", sourcePID: nil),
++            item(namespace: .controlCenter, title: "Clock", sourcePID: nil),
++            item(namespace: .textInputMenuAgent, title: "Item-0", sourcePID: nil),
++        ]
++        var identities = Set<ObjectIdentifier>()
++        for item in items {
++            let image = try #require(MenuBarItemIconFallback.appIcon(for: item))
++            #expect(image.isTemplate)
++            #expect(image === MenuBarItemIconFallback.appIcon(for: item))
++            identities.insert(ObjectIdentifier(image))
++        }
++        #expect(identities.count == 4)
++    }
++
++    @Test("A third-party item named WiFi keeps its owning app icon")
++    func matchingThirdPartyTitleKeepsItsAppIcon() {
++        let item = item(namespace: .string("com.example.utility"), title: "WiFi", sourcePID: ownPID)
++        #expect(MenuBarItemIconFallback.appIcon(for: item) === MenuBarItemIconFallback.cachedAppIcon(forPID: ownPID))
++        let missingApp = self.item(namespace: .string("com.example.closed"), title: "WiFi", sourcePID: nil)
++        #expect(MenuBarItemIconFallback.appIcon(for: missingApp) == nil)
++    }
++
++    @Test("Real captures still win when the app-icon preference is off")
++    func realCaptureRemainsPreferred() {
++        let item = item(namespace: .controlCenter, title: "Battery", sourcePID: nil)
++        #expect(!MenuBarItemIconFallback.shouldUseAppIcon(for: item, hasCapture: true, prefersAppIcon: false))
++        #expect(MenuBarItemIconFallback.shouldUseAppIcon(for: item, hasCapture: false, prefersAppIcon: false))
++    }
++
++    @Test("Cached system symbols remain visible in light and dark settings")
++    func cachedSystemSymbolsFollowAppearance() throws {
++        let item = item(namespace: .controlCenter, title: "WiFi", sourcePID: nil)
++        let image = try #require(MenuBarItemIconFallback.appIcon(for: item))
++        let light = try symbolBrightness(image, appearance: .aqua)
++        let dark = try symbolBrightness(image, appearance: .darkAqua)
++        #expect(light < 0.2)
++        #expect(dark > 0.8)
++    }
++
++    private func symbolBrightness(_ image: NSImage, appearance name: NSAppearance.Name) throws -> Double {
++        let appearance = try #require(NSAppearance(named: name))
++        let bitmap = try #require(NSBitmapImageRep(
++            bitmapDataPlanes: nil, pixelsWide: 32, pixelsHigh: 32,
++            bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
++            colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0
++        ))
++        let context = try #require(NSGraphicsContext(bitmapImageRep: bitmap))
++        appearance.performAsCurrentDrawingAppearance {
++            NSGraphicsContext.saveGraphicsState()
++            defer { NSGraphicsContext.restoreGraphicsState() }
++            NSGraphicsContext.current = context
++            NSColor.clear.setFill()
++            NSRect(x: 0, y: 0, width: 32, height: 32).fill(using: .copy)
++            NSColor.secondaryLabelColor.set()
++            image.draw(in: NSRect(x: 2, y: 2, width: 28, height: 28), from: .zero, operation: .sourceOver, fraction: 1)
++        }
++        var weightedRed = 0.0
++        var alpha = 0.0
++        for x in 0 ..< 32 {
++            for y in 0 ..< 32 {
++                let color = try #require(bitmap.colorAt(x: x, y: y)?.usingColorSpace(.deviceRGB))
++                weightedRed += color.redComponent * color.alphaComponent
++                alpha += color.alphaComponent
++            }
++        }
++        #expect(alpha > 0)
++        return weightedRed / max(alpha, 1)
++    }
+ }
