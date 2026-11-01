@@ -1,0 +1,114 @@
+name: Build Thaw system symbols
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: thaw-system-symbols
+  cancel-in-progress: true
+env:
+  THAW_COMMIT: dc7492856985517a9828cc7346a4198b793c1264
+defaults:
+  run:
+    shell: bash
+jobs:
+  lint:
+    if: github.event.repository.private == false
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: source
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          path: recipe
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: thaw-app/Thaw
+          ref: ${{ env.THAW_COMMIT }}
+          path: source
+          persist-credentials: false
+      - name: Apply reviewed patch
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$THAW_COMMIT"
+          git apply --check --whitespace=error ../recipe/system-symbols.patch
+          git apply --whitespace=error ../recipe/system-symbols.patch
+          git diff --check
+      - name: Verify input list and lint
+        run: |
+          set -euo pipefail
+          bash scripts/generate-swiftlint-inputs.sh /tmp/swiftlint-inputs.xcfilelist
+          diff -u scripts/swiftlint-inputs.xcfilelist /tmp/swiftlint-inputs.xcfilelist
+          docker run --rm -v "$PWD:/work" -w /work ghcr.io/realm/swiftlint:0.63.3@sha256:b70b763c949399cc3e4fdcfbc7588944d9503d498b6d96e853dfa07a944256e6 swiftlint --strict
+  build:
+    if: github.event.repository.private == false
+    needs: lint
+    runs-on: macos-26
+    timeout-minutes: 45
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
+      HOMEBREW_NO_AUTO_UPDATE: 1
+    defaults:
+      run:
+        working-directory: source
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          path: recipe
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: thaw-app/Thaw
+          ref: ${{ env.THAW_COMMIT }}
+          path: source
+          persist-credentials: false
+      - name: Verify environment and apply patch
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = arm64
+          test -d "$DEVELOPER_DIR"
+          xcodebuild -version
+          xcrun swift --version
+          test "$(git rev-parse HEAD)" = "$THAW_COMMIT"
+          git apply --check --whitespace=error ../recipe/system-symbols.patch
+          git apply --whitespace=error ../recipe/system-symbols.patch
+          git diff --check
+          shasum -a 256 ../recipe/system-symbols.patch
+      - name: Run upstream tests
+        run: |
+          set -euo pipefail
+          xcodebuild test -project Thaw.xcodeproj -scheme Thaw -configuration Debug \
+            -destination 'platform=macOS,arch=arm64' -derivedDataPath "$RUNNER_TEMP/ThawBuild" \
+            -onlyUsePackageVersionsFromResolvedFile \
+            ARCHS=arm64 ONLY_ACTIVE_ARCH=YES MACOSX_DEPLOYMENT_TARGET=15.0 \
+            CODE_SIGN_IDENTITY="" CODE_SIGNING_REQUIRED=NO CODE_SIGNING_ALLOWED=NO DEVELOPMENT_TEAM=""
+      - name: Build unsigned arm64 app
+        run: |
+          set -euo pipefail
+          xcodebuild build -project Thaw.xcodeproj -scheme Thaw -configuration Release \
+            -destination 'platform=macOS,arch=arm64' -derivedDataPath "$RUNNER_TEMP/ThawBuild" \
+            -onlyUsePackageVersionsFromResolvedFile \
+            ARCHS=arm64 ONLY_ACTIVE_ARCH=YES MACOSX_DEPLOYMENT_TARGET=15.0 \
+            CODE_SIGN_IDENTITY="" CODE_SIGNING_REQUIRED=NO CODE_SIGNING_ALLOWED=NO DEVELOPMENT_TEAM=""
+      - name: Verify and package
+        run: |
+          set -euo pipefail
+          product_dir="$RUNNER_TEMP/ThawBuild/Build/Products/Release"
+          app="$product_dir/Thaw.app"
+          executable="$app/Contents/MacOS/Thaw"
+          test -f "$executable"
+          test "$(lipo -archs "$executable")" = arm64
+          test "$(/usr/libexec/PlistBuddy -c 'Print :LSMinimumSystemVersion' "$app/Contents/Info.plist")" = 15.0
+          xcrun vtool -show-build "$executable"
+          tar -czf "$RUNNER_TEMP/Thaw-2.2.0-beta.1-arm64-unsigned.tar.gz" -C "$product_dir" Thaw.app
+          shasum -a 256 "$RUNNER_TEMP/Thaw-2.2.0-beta.1-arm64-unsigned.tar.gz"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: Thaw-2.2.0-beta.1-arm64-unsigned
+          path: ${{ runner.temp }}/Thaw-2.2.0-beta.1-arm64-unsigned.tar.gz
+          retention-days: 1
+          if-no-files-found: error
+          compression-level: 0
